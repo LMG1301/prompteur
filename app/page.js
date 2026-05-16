@@ -175,8 +175,12 @@ export default function Prompteur() {
   const sentenceIdxRef = useRef(0);
   const voiceEnabledRef = useRef(false);
   const audioRef = useRef(null);
-  const audioCacheRef = useRef(new Map()); // idx -> Promise<string> (blob URL)
+  const audioCacheRef = useRef(new Map()); // "idx|voice|rate|pitch" -> Promise<string>
   const wakeLockRef = useRef(null);
+  const voiceURIRef = useRef("fr-FR-DeniseNeural");
+  const voiceRateRef = useRef(1);
+  const voicePitchRef = useRef(0);
+  const consecutiveErrorsRef = useRef(0);
 
   // Load saved prefs
   useEffect(() => {
@@ -242,26 +246,18 @@ export default function Prompteur() {
   }, [rawText]);
 
   useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
+  useEffect(() => { voiceURIRef.current = voiceURI; }, [voiceURI]);
+  useEffect(() => { voiceRateRef.current = voiceRate; }, [voiceRate]);
+  useEffect(() => { voicePitchRef.current = voicePitch; }, [voicePitch]);
 
-  // Crée l'élément audio une fois
+  // Crée l'élément audio une fois (et garde une seule instance)
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (audioRef.current) return;
     const a = new Audio();
     a.preload = "auto";
     audioRef.current = a;
-    return () => {
-      a.pause();
-      a.src = "";
-      audioRef.current = null;
-    };
   }, []);
-
-  // Vide le cache audio si la voix/le débit/la hauteur change
-  useEffect(() => {
-    const cache = audioCacheRef.current;
-    cache.forEach((p) => { p.then((url) => URL.revokeObjectURL(url)).catch(() => {}); });
-    cache.clear();
-  }, [voiceURI, voicePitch, voiceRate]);
 
   // Animation
   const animate = useCallback((ts) => {
@@ -312,83 +308,122 @@ export default function Prompteur() {
     container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
   }, []);
 
-  // Récupère (ou met en cache) le blob audio pour une phrase donnée
+  // Garde une ref vers sentenceData pour lire dans des callbacks stables
+  const sentenceDataRef = useRef(sentenceData);
+  useEffect(() => { sentenceDataRef.current = sentenceData; }, [sentenceData]);
+
+  // Récupère (ou met en cache) le blob audio pour une phrase + params donnés
   const fetchSentenceAudio = useCallback((idx) => {
     const cache = audioCacheRef.current;
-    if (cache.has(idx)) return cache.get(idx);
-    const text = sentenceData.all[idx];
+    const text = sentenceDataRef.current.all[idx];
     if (!text) return Promise.reject(new Error("no sentence"));
-    const { ssmlRate } = computeRates(voiceRate);
+    const voice = voiceURIRef.current;
+    const rate = voiceRateRef.current;
+    const pitch = voicePitchRef.current;
+    const key = `${idx}|${voice}|${rate.toFixed(2)}|${pitch.toFixed(2)}`;
+    if (cache.has(key)) return cache.get(key);
+    const { ssmlRate } = computeRates(rate);
     const promise = fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
-        voice: voiceURI,
+        voice,
         rate: ssmlRate,
-        pitch: Math.round(voicePitch * 100), // -0.5..+0.5 -> -50..+50 Hz
+        pitch: Math.round(pitch * 100),
       }),
     }).then(async (r) => {
-      if (!r.ok) throw new Error("TTS API failed: " + r.status);
-      const blob = await r.blob();
-      return URL.createObjectURL(blob);
+      if (!r.ok) throw new Error("TTS " + r.status);
+      return URL.createObjectURL(await r.blob());
+    }).catch((e) => {
+      cache.delete(key); // Permet retry après échec
+      throw e;
     });
-    cache.set(idx, promise);
-    return promise;
-  }, [sentenceData, voiceURI, voiceRate, voicePitch]);
-
-  const preloadNext = useCallback((idx) => {
-    if (idx + 1 < sentenceData.all.length) {
-      fetchSentenceAudio(idx + 1).catch(() => {});
+    cache.set(key, promise);
+    // Limite simple : 30 entrées max
+    if (cache.size > 30) {
+      const firstKey = cache.keys().next().value;
+      cache.get(firstKey)?.then((u) => URL.revokeObjectURL(u)).catch(() => {});
+      cache.delete(firstKey);
     }
-  }, [fetchSentenceAudio, sentenceData]);
+    return promise;
+  }, []);
 
-  // Media Session API : contrôles depuis l'écran verrouillé / centre de contrôle
+  // Media Session API : métadonnées pour écran verrouillé
   const updateMediaSession = useCallback((idx) => {
     if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
-    const total = sentenceData.all.length;
-    const txt = sentenceData.all[idx] || "";
-    navigator.mediaSession.metadata = new window.MediaMetadata({
-      title: "Prompteur",
-      artist: `Phrase ${idx + 1} / ${total}`,
-      album: txt.slice(0, 80),
-    });
-  }, [sentenceData]);
+    const total = sentenceDataRef.current.all.length;
+    const txt = sentenceDataRef.current.all[idx] || "";
+    try {
+      navigator.mediaSession.metadata = new window.MediaMetadata({
+        title: "Prompteur",
+        artist: `Phrase ${idx + 1} / ${total}`,
+        album: txt.slice(0, 80),
+      });
+      navigator.mediaSession.playbackState = "playing";
+    } catch {}
+  }, []);
 
+  // Lit la phrase à l'index donné — STABLE (ne dépend pas des paramètres dynamiques)
   const playSentence = useCallback(async (idx) => {
     if (!voiceEnabledRef.current) return;
     const audio = audioRef.current;
     if (!audio) return;
-    if (idx >= sentenceData.all.length) {
+    const total = sentenceDataRef.current.all.length;
+    if (idx < 0) idx = 0;
+    if (idx >= total) {
       voiceEnabledRef.current = false;
       setVoiceEnabled(false);
       setVoicePaused(false);
       setCurrentSentence(-1);
+      consecutiveErrorsRef.current = 0;
       return;
     }
     sentenceIdxRef.current = idx;
+    setCurrentSentence(idx);
+    scrollToSentence(idx);
+    updateMediaSession(idx);
     setVoiceLoading(true);
     try {
       const url = await fetchSentenceAudio(idx);
-      if (!voiceEnabledRef.current) { setVoiceLoading(false); return; }
-      const { playbackRate } = computeRates(voiceRate);
+      if (!voiceEnabledRef.current || sentenceIdxRef.current !== idx) {
+        setVoiceLoading(false);
+        return;
+      }
+      try { audio.pause(); } catch {}
       audio.src = url;
-      audio.playbackRate = playbackRate;
-      audio.preservesPitch = false;
-      setCurrentSentence(idx);
-      scrollToSentence(idx);
-      updateMediaSession(idx);
+      audio.playbackRate = computeRates(voiceRateRef.current).playbackRate;
+      try { audio.preservesPitch = false; } catch {}
       await audio.play();
       setVoiceLoading(false);
-      preloadNext(idx);
+      consecutiveErrorsRef.current = 0;
+      // Précharge la phrase suivante
+      if (idx + 1 < total) {
+        fetchSentenceAudio(idx + 1).catch(() => {});
+      }
     } catch (e) {
-      console.error("playSentence error", e);
+      console.warn("playSentence error idx=" + idx, e?.message || e);
       setVoiceLoading(false);
-      if (voiceEnabledRef.current) playSentence(idx + 1);
+      consecutiveErrorsRef.current += 1;
+      // Si trop d'erreurs consécutives, on stoppe pour éviter la boucle
+      if (consecutiveErrorsRef.current > 3) {
+        voiceEnabledRef.current = false;
+        setVoiceEnabled(false);
+        setVoicePaused(false);
+        setCurrentSentence(-1);
+        consecutiveErrorsRef.current = 0;
+        return;
+      }
+      // Retry sur la phrase suivante après un court délai
+      if (voiceEnabledRef.current) {
+        setTimeout(() => {
+          if (voiceEnabledRef.current) playSentence(idx + 1);
+        }, 250);
+      }
     }
-  }, [sentenceData, voiceRate, fetchSentenceAudio, scrollToSentence, preloadNext, updateMediaSession]);
+  }, [scrollToSentence, fetchSentenceAudio, updateMediaSession]);
 
-  // Attache les handlers sur l'audio (onended -> next)
+  // Attache les handlers audio UNE SEULE FOIS (playSentence est stable)
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
@@ -398,6 +433,15 @@ export default function Prompteur() {
     };
     const onError = () => {
       if (!voiceEnabledRef.current) return;
+      consecutiveErrorsRef.current += 1;
+      if (consecutiveErrorsRef.current > 3) {
+        voiceEnabledRef.current = false;
+        setVoiceEnabled(false);
+        setVoicePaused(false);
+        setCurrentSentence(-1);
+        consecutiveErrorsRef.current = 0;
+        return;
+      }
       playSentence(sentenceIdxRef.current + 1);
     };
     a.addEventListener("ended", onEnded);
@@ -435,14 +479,15 @@ export default function Prompteur() {
   }, [releaseWakeLock]);
 
   const startVoice = useCallback((fromIdx = 0) => {
-    if (sentenceData.all.length === 0) return;
+    if (sentenceDataRef.current.all.length === 0) return;
     pause();
+    consecutiveErrorsRef.current = 0;
     voiceEnabledRef.current = true;
     setVoiceEnabled(true);
     setVoicePaused(false);
     requestWakeLock();
     playSentence(fromIdx);
-  }, [pause, sentenceData, playSentence, requestWakeLock]);
+  }, [pause, playSentence, requestWakeLock]);
 
   const toggleVoicePause = useCallback(() => {
     const a = audioRef.current;
@@ -846,7 +891,9 @@ export default function Prompteur() {
 
         {/* Top bar */}
         <div style={{
-          padding: isMobile ? "10px 12px" : "10px 20px",
+          padding: isMobile
+            ? "calc(10px + env(safe-area-inset-top)) 12px 10px"
+            : "10px 20px",
           display: "flex", alignItems: "center", justifyContent: "space-between",
           borderBottom: `1px solid ${t.border}`,
           flexShrink: 0, zIndex: 10,
@@ -865,39 +912,54 @@ export default function Prompteur() {
             minHeight: isMobile ? "44px" : "auto",
           }}>← Texte</button>
 
-          <div style={{ display: "flex", alignItems: "center", gap: isMobile ? "6px" : "12px" }}>
-            {/* Speed */}
-            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <button onClick={() => setSpeed(s => Math.max(MIN_SPEED, s - 10))} style={btn}>−</button>
-              <span style={{ fontSize: isMobile ? "15px" : "13px", fontWeight: 700, color: t.accent, minWidth: "35px", textAlign: "center" }}>{speed}</span>
-              <button onClick={() => setSpeed(s => Math.min(MAX_SPEED, s + 10))} style={btn}>+</button>
-            </div>
-            <div style={{ width: "1px", height: "16px", background: t.border }} />
-            {/* Theme toggle quick */}
-            <div style={{ display: "flex", gap: "2px" }}>
-              {Object.values(THEMES).map(th => (
-                <button key={th.key} onClick={() => setThemeKey(th.key)} style={{
-                  width: isMobile ? "32px" : "24px",
-                  height: isMobile ? "32px" : "24px",
-                  borderRadius: "6px",
-                  background: th.bg,
-                  border: `2px solid ${themeKey === th.key ? th.accent : "transparent"}`,
-                  cursor: "pointer",
-                }} />
-              ))}
-            </div>
-            <div style={{ width: "1px", height: "16px", background: t.border }} />
+          <div style={{ display: "flex", alignItems: "center", gap: isMobile ? "8px" : "12px" }}>
+            {/* Sur desktop seulement : speed +/- et theme switcher */}
+            {!isMobile && (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                  <button onClick={() => setSpeed(s => Math.max(MIN_SPEED, s - 10))} style={btn}>−</button>
+                  <span style={{ fontSize: "13px", fontWeight: 700, color: t.accent, minWidth: "35px", textAlign: "center" }}>{speed}</span>
+                  <button onClick={() => setSpeed(s => Math.min(MAX_SPEED, s + 10))} style={btn}>+</button>
+                </div>
+                <div style={{ width: "1px", height: "16px", background: t.border }} />
+                <div style={{ display: "flex", gap: "2px" }}>
+                  {Object.values(THEMES).map(th => (
+                    <button key={th.key} onClick={() => setThemeKey(th.key)} style={{
+                      width: "24px", height: "24px",
+                      borderRadius: "6px",
+                      background: th.bg,
+                      border: `2px solid ${themeKey === th.key ? th.accent : "transparent"}`,
+                      cursor: "pointer",
+                    }} />
+                  ))}
+                </div>
+                <div style={{ width: "1px", height: "16px", background: t.border }} />
+              </>
+            )}
             <button onClick={toggleVoice} title="Lecture à haute voix (V)" style={{
-              ...btn,
-              background: voiceEnabled ? t.accentBg : t.controlBg,
-              color: voiceEnabled ? t.accent : t.textSoft,
-              fontSize: isMobile ? "18px" : "14px",
-            }}>🔊</button>
-            <button onClick={() => setShowSettings(p => !p)} style={{
-              ...btn,
+              background: voiceEnabled ? t.accentGrad : t.controlBg,
+              border: voiceEnabled ? "none" : `1px solid ${t.controlBorder}`,
+              color: voiceEnabled ? t.btnText : t.textSoft,
+              minWidth: isMobile ? "52px" : "44px",
+              height: isMobile ? "44px" : "36px",
+              borderRadius: isMobile ? "12px" : "10px",
+              fontSize: isMobile ? "22px" : "16px",
+              cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              padding: "0 10px",
+              fontFamily: "'DM Sans', sans-serif",
+              fontWeight: 600,
+            }}>{voiceLoading ? "⏳" : "🔊"}</button>
+            <button onClick={() => setShowSettings(p => !p)} title="Paramètres" style={{
               background: showSettings ? t.accentBg : t.controlBg,
+              border: `1px solid ${showSettings ? t.accentBorder : t.controlBorder}`,
               color: showSettings ? t.accent : t.textSoft,
-              fontSize: isMobile ? "18px" : "14px",
+              minWidth: isMobile ? "52px" : "44px",
+              height: isMobile ? "44px" : "36px",
+              borderRadius: isMobile ? "12px" : "10px",
+              fontSize: isMobile ? "22px" : "16px",
+              cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
             }}>⚙</button>
           </div>
         </div>
@@ -905,12 +967,34 @@ export default function Prompteur() {
         {/* Settings drawer */}
         {showSettings && showControls && (
           <div style={{
-            padding: isMobile ? "16px" : "12px 24px",
+            padding: isMobile ? "14px 16px 16px" : "12px 24px",
             borderBottom: `1px solid ${t.border}`,
             background: t.barBg, backdropFilter: "blur(12px)",
             zIndex: 9, display: "flex", flexDirection: "column",
-            gap: isMobile ? "18px" : "14px", flexShrink: 0,
+            gap: isMobile ? "14px" : "14px", flexShrink: 0,
+            maxHeight: isMobile ? "60vh" : "55vh",
+            overflowY: "auto",
+            WebkitOverflowScrolling: "touch",
           }}>
+            {/* Theme switcher mobile uniquement */}
+            {isMobile && (
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <span style={{ ...labelStyle(t), minWidth: "55px" }}>Thème</span>
+                <div style={{ display: "flex", gap: "6px" }}>
+                  {Object.values(THEMES).map(th => (
+                    <button key={th.key} onClick={() => setThemeKey(th.key)} style={{
+                      width: "40px", height: "40px",
+                      borderRadius: "10px",
+                      background: th.bg,
+                      border: `2px solid ${themeKey === th.key ? th.accent : th.border}`,
+                      cursor: "pointer",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: "12px", color: th.text, fontWeight: 700,
+                    }}>{th.label[0]}</button>
+                  ))}
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={{ ...labelStyle(t), minWidth: "55px" }}>Vitesse</span>
               <input type="range" min={MIN_SPEED} max={MAX_SPEED} step={5} value={speed}
@@ -1085,7 +1169,9 @@ export default function Prompteur() {
 
         {/* Bottom controls */}
         <div style={{
-          padding: isMobile ? "10px 10px 6px" : "12px 24px 8px",
+          padding: isMobile
+            ? "10px 12px calc(8px + env(safe-area-inset-bottom))"
+            : "12px 24px 8px",
           borderTop: `1px solid ${t.border}`,
           flexShrink: 0, zIndex: 10,
           background: t.barBg, backdropFilter: "blur(12px)",
@@ -1093,14 +1179,27 @@ export default function Prompteur() {
           transform: showControls ? "translateY(0)" : "translateY(100%)",
           transition: "opacity 0.4s, transform 0.4s",
         }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: isMobile ? "6px" : "12px" }}>
+          {/* Ligne 1 : contrôles principaux */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: isMobile ? "10px" : "12px" }}>
             <CircleBtn t={t} isMobile={isMobile} onClick={resetScroll} title="Reset">
               <svg width={isMobile ? "18" : "15"} height={isMobile ? "18" : "15"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M1 4v6h6" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
               </svg>
             </CircleBtn>
 
-            <CircleBtn t={t} isMobile={isMobile} onClick={() => { pause(); if (scrollRef.current) scrollRef.current.scrollTop = Math.max(0, scrollRef.current.scrollTop - 400); }}>
+            <CircleBtn
+              t={t}
+              isMobile={isMobile}
+              title={voiceEnabled ? "Phrase précédente" : "Reculer"}
+              onClick={() => {
+                if (voiceEnabled) {
+                  playSentence(Math.max(0, sentenceIdxRef.current - 1));
+                } else {
+                  pause();
+                  if (scrollRef.current) scrollRef.current.scrollTop = Math.max(0, scrollRef.current.scrollTop - 400);
+                }
+              }}
+            >
               <svg width={isMobile ? "18" : "15"} height={isMobile ? "18" : "15"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polygon points="19,20 9,12 19,4" /><line x1="5" y1="19" x2="5" y2="5" />
               </svg>
@@ -1108,50 +1207,110 @@ export default function Prompteur() {
 
             <button onClick={togglePlayOrVoice} style={{
               background: t.accentGrad, border: "none", color: t.btnText,
-              width: isMobile ? "60px" : "48px", height: isMobile ? "60px" : "48px",
+              width: isMobile ? "64px" : "48px", height: isMobile ? "64px" : "48px",
               borderRadius: "50%", cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
+              boxShadow: isMobile ? "0 4px 12px rgba(0,0,0,0.15)" : "none",
             }}>
               {(voiceEnabled ? !voicePaused : isPlaying) ? (
-                <svg width={isMobile ? "22" : "20"} height={isMobile ? "22" : "20"} viewBox="0 0 24 24" fill="currentColor">
+                <svg width={isMobile ? "26" : "20"} height={isMobile ? "26" : "20"} viewBox="0 0 24 24" fill="currentColor">
                   <rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" />
                 </svg>
               ) : (
-                <svg width={isMobile ? "22" : "20"} height={isMobile ? "22" : "20"} viewBox="0 0 24 24" fill="currentColor">
+                <svg width={isMobile ? "26" : "20"} height={isMobile ? "26" : "20"} viewBox="0 0 24 24" fill="currentColor">
                   <polygon points="6,4 20,12 6,20" />
                 </svg>
               )}
             </button>
 
-            <CircleBtn t={t} isMobile={isMobile} onClick={() => { pause(); if (scrollRef.current) scrollRef.current.scrollTop += 400; }}>
+            <CircleBtn
+              t={t}
+              isMobile={isMobile}
+              title={voiceEnabled ? "Phrase suivante" : "Avancer"}
+              onClick={() => {
+                if (voiceEnabled) {
+                  playSentence(sentenceIdxRef.current + 1);
+                } else {
+                  pause();
+                  if (scrollRef.current) scrollRef.current.scrollTop += 400;
+                }
+              }}
+            >
               <svg width={isMobile ? "18" : "15"} height={isMobile ? "18" : "15"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polygon points="5,4 15,12 5,20" /><line x1="19" y1="5" x2="19" y2="19" />
               </svg>
             </CircleBtn>
 
-            <span style={{ fontSize: isMobile ? "13px" : "12px", color: t.textMuted, fontWeight: 500, minWidth: "28px", textAlign: "center" }}>
-              {Math.round(progress)}%
-            </span>
-
-            <div
-              style={{
-                width: isMobile ? "80px" : "180px", height: isMobile ? "10px" : "6px",
-                background: t.controlBg, borderRadius: "5px",
-                cursor: "pointer", position: "relative",
-              }}
-              onClick={(e) => { e.stopPropagation(); jumpProgress(e.clientX, e.currentTarget); }}
-              onTouchEnd={(e) => { e.stopPropagation(); if (e.changedTouches[0]) jumpProgress(e.changedTouches[0].clientX, e.currentTarget); }}
+            <CircleBtn
+              t={t}
+              isMobile={isMobile}
+              title="Lecture vocale"
+              onClick={toggleVoice}
             >
-              <div style={{
-                position: "absolute", left: 0, top: 0, height: "100%",
-                width: `${progress}%`, background: t.accent, borderRadius: "5px",
-                transition: "width 0.3s",
-              }} />
-            </div>
+              <span style={{
+                fontSize: isMobile ? "20px" : "16px",
+                lineHeight: 1,
+                color: voiceEnabled ? t.accent : t.textSoft,
+              }}>{voiceLoading ? "⏳" : "🔊"}</span>
+            </CircleBtn>
           </div>
 
+          {/* Ligne 2 : progression pleine largeur (mobile) */}
+          {isMobile ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", padding: "10px 4px 2px" }}>
+              <span style={{ fontSize: "12px", color: t.textMuted, fontWeight: 600, minWidth: "32px" }}>
+                {Math.round(progress)}%
+              </span>
+              <div
+                style={{
+                  flex: 1, height: "10px",
+                  background: t.controlBg, borderRadius: "5px",
+                  cursor: "pointer", position: "relative",
+                }}
+                onClick={(e) => { e.stopPropagation(); jumpProgress(e.clientX, e.currentTarget); }}
+                onTouchEnd={(e) => { e.stopPropagation(); if (e.changedTouches[0]) jumpProgress(e.changedTouches[0].clientX, e.currentTarget); }}
+              >
+                <div style={{
+                  position: "absolute", left: 0, top: 0, height: "100%",
+                  width: `${progress}%`, background: t.accent, borderRadius: "5px",
+                  transition: "width 0.3s",
+                }} />
+              </div>
+              {voiceEnabled && sentenceData.all.length > 0 && (
+                <span style={{ fontSize: "11px", color: t.textMuted, minWidth: "44px", textAlign: "right" }}>
+                  {currentSentence + 1}/{sentenceData.all.length}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "10px", paddingTop: "10px" }}>
+              <span style={{ fontSize: "12px", color: t.textMuted, fontWeight: 500, minWidth: "32px", textAlign: "center" }}>
+                {Math.round(progress)}%
+              </span>
+              <div
+                style={{
+                  width: "240px", height: "6px",
+                  background: t.controlBg, borderRadius: "5px",
+                  cursor: "pointer", position: "relative",
+                }}
+                onClick={(e) => { e.stopPropagation(); jumpProgress(e.clientX, e.currentTarget); }}
+              >
+                <div style={{
+                  position: "absolute", left: 0, top: 0, height: "100%",
+                  width: `${progress}%`, background: t.accent, borderRadius: "5px",
+                  transition: "width 0.3s",
+                }} />
+              </div>
+              {voiceEnabled && sentenceData.all.length > 0 && (
+                <span style={{ fontSize: "11px", color: t.textMuted }}>
+                  Phrase {currentSentence + 1}/{sentenceData.all.length}
+                </span>
+              )}
+            </div>
+          )}
+
           {!isMobile && (
-            <div style={{ display: "flex", justifyContent: "center", gap: "14px", paddingTop: "8px", paddingBottom: "4px" }}>
+            <div style={{ display: "flex", justifyContent: "center", gap: "14px", paddingTop: "8px", paddingBottom: "4px", flexWrap: "wrap" }}>
               {[["Espace", "lecture"], ["←→", "naviguer"], ["↑↓", "vitesse"], ["V", "voix"], ["T", "thème"], ["M", "miroir"], ["R", "reset"], ["Esc", "retour"]].map(([k, l]) => (
                 <span key={k} style={{ fontSize: "10px", color: t.textMuted }}>
                   <kbd style={{ background: t.controlBg, padding: "1px 5px", borderRadius: "3px", fontSize: "10px", fontFamily: "'DM Sans'" }}>{k}</kbd> {l}
@@ -1159,19 +1318,11 @@ export default function Prompteur() {
               ))}
             </div>
           )}
-
-          {isMobile && (
-            <div style={{ textAlign: "center", padding: "8px 0 4px" }}>
-              <span style={{ fontSize: "11px", color: t.textMuted }}>
-                Tap = pause · Swipe ← accélérer · Swipe → ralentir
-              </span>
-            </div>
-          )}
         </div>
 
-        {!isPlaying && (
+        {(!isPlaying && !voiceEnabled) && (
           <div style={{
-            position: "absolute", bottom: isMobile ? "130px" : "140px",
+            position: "absolute", bottom: isMobile ? "180px" : "150px",
             left: "50%", transform: "translateX(-50%)",
             fontSize: isMobile ? "15px" : "13px", color: t.textMuted,
             fontFamily: "'DM Sans', sans-serif", fontWeight: 500,

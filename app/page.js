@@ -85,6 +85,35 @@ const SPEED_PRESETS = [
 const MIN_SPEED = 10, MAX_SPEED = 300;
 const MIN_FONT = 16, MAX_FONT = 64;
 const MIN_WIDTH = 40, MAX_WIDTH = 100;
+const VOICE_MIN = 0.5, VOICE_MAX = 4;
+
+// Voix neurales Edge (qualité humaine, gratuites)
+const EDGE_VOICES = [
+  { id: "fr-FR-DeniseNeural", label: "Denise (FR, femme)" },
+  { id: "fr-FR-HenriNeural", label: "Henri (FR, homme)" },
+  { id: "fr-FR-VivienneMultilingualNeural", label: "Vivienne (FR, femme, expressive)" },
+  { id: "fr-FR-RemyMultilingualNeural", label: "Rémy (FR, homme, expressive)" },
+  { id: "fr-FR-BrigitteNeural", label: "Brigitte (FR, femme)" },
+  { id: "fr-FR-AlainNeural", label: "Alain (FR, homme)" },
+  { id: "fr-FR-CoralieNeural", label: "Coralie (FR, femme)" },
+  { id: "fr-FR-JeromeNeural", label: "Jérôme (FR, homme)" },
+  { id: "fr-FR-CelesteNeural", label: "Céleste (FR, femme)" },
+  { id: "fr-FR-ClaudeNeural", label: "Claude (FR, homme)" },
+  { id: "fr-FR-EloiseNeural", label: "Éloïse (FR, enfant)" },
+  { id: "fr-CA-SylvieNeural", label: "Sylvie (CA, femme)" },
+  { id: "fr-CA-AntoineNeural", label: "Antoine (CA, homme)" },
+  { id: "fr-CA-JeanNeural", label: "Jean (CA, homme)" },
+  { id: "fr-CA-ThierryNeural", label: "Thierry (CA, homme)" },
+];
+
+// Convertit la vitesse globale (0.5×–4×) en (rate SSML %, playbackRate audio)
+// Jusqu'à 2× on accélère la voix elle-même (reste naturelle).
+// Au-delà, on combine avec playbackRate (chipmunk léger mais lisible).
+function computeRates(speed) {
+  const s = Math.max(VOICE_MIN, Math.min(VOICE_MAX, speed));
+  if (s <= 2) return { ssmlRate: Math.round((s - 1) * 100), playbackRate: 1 };
+  return { ssmlRate: 100, playbackRate: s / 2 };
+}
 
 function useIsMobile() {
   const [m, setM] = useState(false);
@@ -127,9 +156,9 @@ export default function Prompteur() {
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voicePaused, setVoicePaused] = useState(false);
   const [voiceRate, setVoiceRate] = useState(1);
-  const [voicePitch, setVoicePitch] = useState(1);
-  const [voiceURI, setVoiceURI] = useState("");
-  const [voices, setVoices] = useState([]);
+  const [voicePitch, setVoicePitch] = useState(0);
+  const [voiceURI, setVoiceURI] = useState("fr-FR-DeniseNeural");
+  const [voiceLoading, setVoiceLoading] = useState(false);
   const [currentSentence, setCurrentSentence] = useState(-1);
 
   const isMobile = useIsMobile();
@@ -145,6 +174,9 @@ export default function Prompteur() {
   const touchMoved = useRef(false);
   const sentenceIdxRef = useRef(0);
   const voiceEnabledRef = useRef(false);
+  const audioRef = useRef(null);
+  const audioCacheRef = useRef(new Map()); // idx -> Promise<string> (blob URL)
+  const wakeLockRef = useRef(null);
 
   // Load saved prefs
   useEffect(() => {
@@ -154,8 +186,8 @@ export default function Prompteur() {
     setTextWidth(loadFromStorage("textWidth", 70));
     setRawText(loadFromStorage("text", ""));
     setVoiceRate(loadFromStorage("voiceRate", 1));
-    setVoicePitch(loadFromStorage("voicePitch", 1));
-    setVoiceURI(loadFromStorage("voiceURI", ""));
+    setVoicePitch(loadFromStorage("voicePitch", 0));
+    setVoiceURI(loadFromStorage("voiceURI", "fr-FR-DeniseNeural"));
     setMounted(true);
   }, []);
 
@@ -209,20 +241,27 @@ export default function Prompteur() {
     return { byParagraph, all };
   }, [rawText]);
 
-  // Charge la liste des voix disponibles (Web Speech API)
+  useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
+
+  // Crée l'élément audio une fois
   useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    const load = () => {
-      const list = window.speechSynthesis.getVoices();
-      const fr = list.filter((v) => v.lang && v.lang.toLowerCase().startsWith("fr"));
-      setVoices(fr.length > 0 ? fr : list);
+    if (typeof window === "undefined") return;
+    const a = new Audio();
+    a.preload = "auto";
+    audioRef.current = a;
+    return () => {
+      a.pause();
+      a.src = "";
+      audioRef.current = null;
     };
-    load();
-    window.speechSynthesis.onvoiceschanged = load;
-    return () => { if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null; };
   }, []);
 
-  useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
+  // Vide le cache audio si la voix/le débit/la hauteur change
+  useEffect(() => {
+    const cache = audioCacheRef.current;
+    cache.forEach((p) => { p.then((url) => URL.revokeObjectURL(url)).catch(() => {}); });
+    cache.clear();
+  }, [voiceURI, voicePitch, voiceRate]);
 
   // Animation
   const animate = useCallback((ts) => {
@@ -273,71 +312,149 @@ export default function Prompteur() {
     container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
   }, []);
 
-  const speakSentence = useCallback((idx) => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  // Récupère (ou met en cache) le blob audio pour une phrase donnée
+  const fetchSentenceAudio = useCallback((idx) => {
+    const cache = audioCacheRef.current;
+    if (cache.has(idx)) return cache.get(idx);
+    const text = sentenceData.all[idx];
+    if (!text) return Promise.reject(new Error("no sentence"));
+    const { ssmlRate } = computeRates(voiceRate);
+    const promise = fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        voice: voiceURI,
+        rate: ssmlRate,
+        pitch: Math.round(voicePitch * 100), // -0.5..+0.5 -> -50..+50 Hz
+      }),
+    }).then(async (r) => {
+      if (!r.ok) throw new Error("TTS API failed: " + r.status);
+      const blob = await r.blob();
+      return URL.createObjectURL(blob);
+    });
+    cache.set(idx, promise);
+    return promise;
+  }, [sentenceData, voiceURI, voiceRate, voicePitch]);
+
+  const preloadNext = useCallback((idx) => {
+    if (idx + 1 < sentenceData.all.length) {
+      fetchSentenceAudio(idx + 1).catch(() => {});
+    }
+  }, [fetchSentenceAudio, sentenceData]);
+
+  // Media Session API : contrôles depuis l'écran verrouillé / centre de contrôle
+  const updateMediaSession = useCallback((idx) => {
+    if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
+    const total = sentenceData.all.length;
+    const txt = sentenceData.all[idx] || "";
+    navigator.mediaSession.metadata = new window.MediaMetadata({
+      title: "Prompteur",
+      artist: `Phrase ${idx + 1} / ${total}`,
+      album: txt.slice(0, 80),
+    });
+  }, [sentenceData]);
+
+  const playSentence = useCallback(async (idx) => {
     if (!voiceEnabledRef.current) return;
-    const list = sentenceData.all;
-    if (idx >= list.length) {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (idx >= sentenceData.all.length) {
       voiceEnabledRef.current = false;
       setVoiceEnabled(false);
       setVoicePaused(false);
       setCurrentSentence(-1);
       return;
     }
-    const u = new SpeechSynthesisUtterance(list[idx]);
-    u.lang = "fr-FR";
-    u.rate = voiceRate;
-    u.pitch = voicePitch;
-    if (voiceURI) {
-      const v = window.speechSynthesis.getVoices().find((vv) => vv.voiceURI === voiceURI);
-      if (v) u.voice = v;
-    }
-    u.onstart = () => {
+    sentenceIdxRef.current = idx;
+    setVoiceLoading(true);
+    try {
+      const url = await fetchSentenceAudio(idx);
+      if (!voiceEnabledRef.current) { setVoiceLoading(false); return; }
+      const { playbackRate } = computeRates(voiceRate);
+      audio.src = url;
+      audio.playbackRate = playbackRate;
+      audio.preservesPitch = false;
       setCurrentSentence(idx);
       scrollToSentence(idx);
-    };
-    u.onend = () => {
-      if (!voiceEnabledRef.current) return;
-      sentenceIdxRef.current = idx + 1;
-      speakSentence(idx + 1);
-    };
-    u.onerror = () => {
-      if (!voiceEnabledRef.current) return;
-      sentenceIdxRef.current = idx + 1;
-      speakSentence(idx + 1);
-    };
-    window.speechSynthesis.speak(u);
-  }, [sentenceData, voiceRate, voicePitch, voiceURI, scrollToSentence]);
+      updateMediaSession(idx);
+      await audio.play();
+      setVoiceLoading(false);
+      preloadNext(idx);
+    } catch (e) {
+      console.error("playSentence error", e);
+      setVoiceLoading(false);
+      if (voiceEnabledRef.current) playSentence(idx + 1);
+    }
+  }, [sentenceData, voiceRate, fetchSentenceAudio, scrollToSentence, preloadNext, updateMediaSession]);
 
-  const stopVoice = useCallback(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    voiceEnabledRef.current = false;
-    window.speechSynthesis.cancel();
-    setVoiceEnabled(false);
-    setVoicePaused(false);
-    setCurrentSentence(-1);
+  // Attache les handlers sur l'audio (onended -> next)
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    const onEnded = () => {
+      if (!voiceEnabledRef.current) return;
+      playSentence(sentenceIdxRef.current + 1);
+    };
+    const onError = () => {
+      if (!voiceEnabledRef.current) return;
+      playSentence(sentenceIdxRef.current + 1);
+    };
+    a.addEventListener("ended", onEnded);
+    a.addEventListener("error", onError);
+    return () => {
+      a.removeEventListener("ended", onEnded);
+      a.removeEventListener("error", onError);
+    };
+  }, [playSentence]);
+
+  // Wake Lock : empêche l'écran de se verrouiller pendant la lecture
+  const requestWakeLock = useCallback(async () => {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeLockRef.current = await navigator.wakeLock.request("screen");
+      }
+    } catch {}
+  }, []);
+  const releaseWakeLock = useCallback(async () => {
+    try { if (wakeLockRef.current) { await wakeLockRef.current.release(); wakeLockRef.current = null; } } catch {}
   }, []);
 
+  const stopVoice = useCallback(() => {
+    voiceEnabledRef.current = false;
+    const a = audioRef.current;
+    if (a) { try { a.pause(); } catch {} }
+    setVoiceEnabled(false);
+    setVoicePaused(false);
+    setVoiceLoading(false);
+    setCurrentSentence(-1);
+    releaseWakeLock();
+    if (typeof navigator !== "undefined" && "mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "none";
+    }
+  }, [releaseWakeLock]);
+
   const startVoice = useCallback((fromIdx = 0) => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     if (sentenceData.all.length === 0) return;
-    pause(); // stop le scroll automatique
-    window.speechSynthesis.cancel();
+    pause();
     voiceEnabledRef.current = true;
     setVoiceEnabled(true);
     setVoicePaused(false);
-    sentenceIdxRef.current = fromIdx;
-    speakSentence(fromIdx);
-  }, [pause, sentenceData, speakSentence]);
+    requestWakeLock();
+    playSentence(fromIdx);
+  }, [pause, sentenceData, playSentence, requestWakeLock]);
 
   const toggleVoicePause = useCallback(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    if (window.speechSynthesis.paused) {
-      window.speechSynthesis.resume();
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) {
+      a.play().catch(() => {});
       setVoicePaused(false);
-    } else if (window.speechSynthesis.speaking) {
-      window.speechSynthesis.pause();
+      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    } else {
+      a.pause();
       setVoicePaused(true);
+      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
     }
   }, []);
 
@@ -346,14 +463,53 @@ export default function Prompteur() {
     else startVoice(Math.max(0, sentenceIdxRef.current));
   }, [startVoice, stopVoice]);
 
-  // Stop la voix au démontage et quand on quitte le mode reader
+  // Configure les handlers Media Session une fois l'audio prêt
   useEffect(() => {
+    if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
+    const ms = navigator.mediaSession;
+    ms.setActionHandler("play", () => { toggleVoicePause(); });
+    ms.setActionHandler("pause", () => { toggleVoicePause(); });
+    ms.setActionHandler("nexttrack", () => {
+      if (voiceEnabledRef.current) playSentence(sentenceIdxRef.current + 1);
+    });
+    ms.setActionHandler("previoustrack", () => {
+      if (voiceEnabledRef.current) playSentence(Math.max(0, sentenceIdxRef.current - 1));
+    });
     return () => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
+      try {
+        ms.setActionHandler("play", null);
+        ms.setActionHandler("pause", null);
+        ms.setActionHandler("nexttrack", null);
+        ms.setActionHandler("previoustrack", null);
+      } catch {}
+    };
+  }, [toggleVoicePause, playSentence]);
+
+  // Si l'utilisateur revient sur l'onglet, re-acquiert le wake lock
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && voiceEnabledRef.current) {
+        requestWakeLock();
       }
     };
-  }, []);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [requestWakeLock]);
+
+  // Cleanup à l'unmount
+  useEffect(() => {
+    return () => {
+      voiceEnabledRef.current = false;
+      const a = audioRef.current;
+      if (a) { try { a.pause(); a.src = ""; } catch {} }
+      audioCacheRef.current.forEach((p) => p.then((url) => URL.revokeObjectURL(url)).catch(() => {}));
+      audioCacheRef.current.clear();
+      releaseWakeLock();
+    };
+  }, [releaseWakeLock]);
+
+  // Compat : speakSentence alias pour le onClick sur les phrases
+  const speakSentence = playSentence;
 
   const resetScroll = useCallback(() => {
     pause();
@@ -812,39 +968,50 @@ export default function Prompteur() {
                 }}>{voicePaused ? "▶ Reprendre" : "⏸ Pause"}</button>
               )}
             </div>
-            {voices.length > 0 && (
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                <span style={{ ...labelStyle(t), minWidth: "55px" }}>Timbre</span>
-                <select value={voiceURI} onChange={(e) => setVoiceURI(e.target.value)} style={{
-                  flex: 1, maxWidth: "300px",
-                  background: t.controlBg, border: `1px solid ${t.controlBorder}`,
-                  color: t.text, borderRadius: "8px",
-                  padding: isMobile ? "10px 12px" : "6px 10px",
-                  fontSize: isMobile ? "14px" : "12px",
-                  fontFamily: "'DM Sans', sans-serif",
-                }}>
-                  <option value="">Auto (système)</option>
-                  {voices.map((v) => (
-                    <option key={v.voiceURI} value={v.voiceURI}>
-                      {v.name} ({v.lang})
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ ...labelStyle(t), minWidth: "55px" }}>Timbre</span>
+              <select value={voiceURI} onChange={(e) => setVoiceURI(e.target.value)} style={{
+                flex: 1, maxWidth: "300px",
+                background: t.controlBg, border: `1px solid ${t.controlBorder}`,
+                color: t.text, borderRadius: "8px",
+                padding: isMobile ? "10px 12px" : "6px 10px",
+                fontSize: isMobile ? "14px" : "12px",
+                fontFamily: "'DM Sans', sans-serif",
+              }}>
+                {EDGE_VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>{v.label}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
               <span style={{ ...labelStyle(t), minWidth: "55px" }}>Débit</span>
-              <input type="range" min={0.5} max={2} step={0.05} value={voiceRate}
+              <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                {[0.75, 1, 1.25, 1.5, 2, 3].map((v) => (
+                  <button key={v} onClick={() => setVoiceRate(v)} style={{
+                    background: Math.abs(voiceRate - v) < 0.01 ? t.accentBg : "transparent",
+                    border: `1px solid ${Math.abs(voiceRate - v) < 0.01 ? t.accentBorder : t.controlBorder}`,
+                    color: Math.abs(voiceRate - v) < 0.01 ? t.accent : t.textSoft,
+                    padding: isMobile ? "8px 12px" : "4px 10px",
+                    borderRadius: isMobile ? "8px" : "6px",
+                    fontSize: isMobile ? "13px" : "11px",
+                    fontWeight: 600, cursor: "pointer",
+                    fontFamily: "'DM Sans', sans-serif",
+                  }}>{v}×</button>
+                ))}
+              </div>
+              <input type="range" min={VOICE_MIN} max={VOICE_MAX} step={0.05} value={voiceRate}
                 onChange={(e) => setVoiceRate(Number(e.target.value))}
-                style={{ flex: 1, maxWidth: "250px", accentColor: t.accent, background: t.rangeTrack }} />
-              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "36px" }}>{voiceRate.toFixed(2)}×</span>
+                style={{ flex: 1, minWidth: "120px", maxWidth: "200px", accentColor: t.accent, background: t.rangeTrack }} />
+              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "44px", fontWeight: 700 }}>{voiceRate.toFixed(2)}×</span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={{ ...labelStyle(t), minWidth: "55px" }}>Hauteur</span>
-              <input type="range" min={0.5} max={1.5} step={0.05} value={voicePitch}
+              <input type="range" min={-0.5} max={0.5} step={0.05} value={voicePitch}
                 onChange={(e) => setVoicePitch(Number(e.target.value))}
                 style={{ flex: 1, maxWidth: "250px", accentColor: t.accent, background: t.rangeTrack }} />
-              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "36px" }}>{voicePitch.toFixed(2)}</span>
+              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "44px" }}>
+                {voicePitch >= 0 ? "+" : ""}{Math.round(voicePitch * 100)}Hz
+              </span>
             </div>
           </div>
         )}

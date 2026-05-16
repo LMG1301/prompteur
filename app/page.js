@@ -273,14 +273,36 @@ export default function Prompteur() {
   useEffect(() => { voiceRateRef.current = voiceRate; }, [voiceRate]);
   useEffect(() => { voicePitchRef.current = voicePitch; }, [voicePitch]);
 
-  // Crée l'élément audio une fois (et garde une seule instance)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (audioRef.current) return;
+  // ATTENTION: l'élément audio doit être créé dans un user gesture sur iOS,
+  // sinon les play() suivants sont bloqués par la politique d'autoplay.
+  // On le crée à la volée dans `ensureAudio()` appelé depuis le clic utilisateur.
+  const audioReadyRef = useRef(false);
+  const ensureAudio = useCallback(() => {
+    if (audioRef.current) return audioRef.current;
     const a = new Audio();
     a.preload = "auto";
+    a.crossOrigin = "anonymous";
     audioRef.current = a;
+    return a;
   }, []);
+
+  // "Unlock" iOS : sur Safari/PWA iOS, audio.play() doit être appelé une fois
+  // dans un user gesture pour autoriser les play() automatiques ultérieurs.
+  // Cet appel peut rejeter (pas de src), peu importe — l'élément reste "armé".
+  const unlockAudio = useCallback(async () => {
+    if (audioReadyRef.current) return;
+    const a = ensureAudio();
+    try {
+      a.muted = true;
+      const p = a.play();
+      if (p && typeof p.then === "function") {
+        await p.catch(() => {});
+      }
+      try { a.pause(); } catch {}
+      a.muted = false;
+    } catch {}
+    audioReadyRef.current = true;
+  }, [ensureAudio]);
 
   // Animation
   const animate = useCallback((ts) => {
@@ -390,7 +412,7 @@ export default function Prompteur() {
   // Lit la phrase à l'index donné — STABLE (ne dépend pas des paramètres dynamiques)
   const playSentence = useCallback(async (idx) => {
     if (!voiceEnabledRef.current) return;
-    const audio = audioRef.current;
+    const audio = audioRef.current || ensureAudio();
     if (!audio) return;
     const total = sentenceDataRef.current.all.length;
     if (idx < 0) idx = 0;
@@ -446,24 +468,30 @@ export default function Prompteur() {
         }, 250);
       }
     }
-  }, [scrollToSentence, fetchSentenceAudio, updateMediaSession]);
+  }, [scrollToSentence, fetchSentenceAudio, updateMediaSession, ensureAudio]);
 
-  // Attache les handlers audio UNE SEULE FOIS (playSentence est stable)
-  useEffect(() => {
+  // Attache les listeners audio dès qu'il existe — re-binde si l'audio est recréé
+  const audioListenersAttachedRef = useRef(false);
+  const attachAudioListeners = useCallback(() => {
     const a = audioRef.current;
-    if (!a) return;
+    if (!a || audioListenersAttachedRef.current) return;
+    audioListenersAttachedRef.current = true;
     const onEnded = () => {
       if (!voiceEnabledRef.current) return;
       playSentence(sentenceIdxRef.current + 1);
     };
-    const onError = () => {
+    const onError = (e) => {
       if (!voiceEnabledRef.current) return;
+      const err = a.error;
+      const msg = err ? `audio code ${err.code}` : (e?.message || "audio error");
+      console.warn("audio onerror", msg);
       consecutiveErrorsRef.current += 1;
       if (consecutiveErrorsRef.current > 3) {
         voiceEnabledRef.current = false;
         setVoiceEnabled(false);
         setVoicePaused(false);
         setCurrentSentence(-1);
+        setVoiceError(msg);
         consecutiveErrorsRef.current = 0;
         return;
       }
@@ -471,10 +499,6 @@ export default function Prompteur() {
     };
     a.addEventListener("ended", onEnded);
     a.addEventListener("error", onError);
-    return () => {
-      a.removeEventListener("ended", onEnded);
-      a.removeEventListener("error", onError);
-    };
   }, [playSentence]);
 
   // Wake Lock : empêche l'écran de se verrouiller pendant la lecture
@@ -529,10 +553,17 @@ export default function Prompteur() {
     }
   }, []);
 
-  const toggleVoice = useCallback(() => {
-    if (voiceEnabledRef.current) stopVoice();
-    else startVoice(Math.max(0, sentenceIdxRef.current));
-  }, [startVoice, stopVoice]);
+  const toggleVoice = useCallback(async () => {
+    if (voiceEnabledRef.current) {
+      stopVoice();
+      return;
+    }
+    // CRUCIAL : ces appels sont dans le user gesture → débloque iOS audio policy
+    ensureAudio();
+    attachAudioListeners();
+    await unlockAudio();
+    startVoice(Math.max(0, sentenceIdxRef.current));
+  }, [startVoice, stopVoice, ensureAudio, attachAudioListeners, unlockAudio]);
 
   // Configure les handlers Media Session une fois l'audio prêt
   useEffect(() => {

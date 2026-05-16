@@ -33,44 +33,71 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
-export async function POST(req) {
-  let body;
-  try { body = await req.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
+async function synth(text, voice, rate, pitch) {
+  const tts = new MsEdgeTTS();
+  await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+  const { audioStream } = tts.toStream(text, {
+    rate: `${rate >= 0 ? "+" : ""}${rate}%`,
+    pitch: `${pitch >= 0 ? "+" : ""}${pitch}Hz`,
+  });
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    audioStream.on("data", (c) => chunks.push(c));
+    audioStream.on("end", resolve);
+    audioStream.on("error", reject);
+  });
+  try { tts.close(); } catch {}
+  return Buffer.concat(chunks);
+}
 
-  const text = (body?.text || "").toString().trim();
+function audioResponse(buffer) {
+  return new Response(buffer, {
+    status: 200,
+    headers: {
+      "Content-Type": "audio/mpeg",
+      "Content-Length": String(buffer.length),
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=86400, immutable",
+    },
+  });
+}
+
+function readParams(source) {
+  const text = (source.text || "").toString().trim();
+  const voice = ALLOWED_VOICES.has(source.voice) ? source.voice : "fr-FR-DeniseNeural";
+  const rate = clamp(source.rate ?? 0, -50, 100);
+  const pitch = clamp(source.pitch ?? 0, -50, 50);
+  return { text, voice, rate, pitch };
+}
+
+async function handle(params) {
+  const { text, voice, rate, pitch } = params;
   if (!text) return new Response("Missing text", { status: 400 });
   if (text.length > 5000) return new Response("Text too long", { status: 400 });
-
-  const voice = ALLOWED_VOICES.has(body?.voice) ? body.voice : "fr-FR-DeniseNeural";
-  const rate = clamp(body?.rate ?? 0, -50, 100);   // % adjust (-50..+100)
-  const pitch = clamp(body?.pitch ?? 0, -50, 50);  // % adjust (-50..+50)
-
   try {
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const { audioStream } = tts.toStream(text, {
-      rate: `${rate >= 0 ? "+" : ""}${rate}%`,
-      pitch: `${pitch >= 0 ? "+" : ""}${pitch}Hz`,
-    });
-
-    const chunks = [];
-    await new Promise((resolve, reject) => {
-      audioStream.on("data", (c) => chunks.push(c));
-      audioStream.on("end", resolve);
-      audioStream.on("error", reject);
-    });
-    const buffer = Buffer.concat(chunks);
-
-    return new Response(buffer, {
-      status: 200,
-      headers: {
-        "Content-Type": "audio/mpeg",
-        "Content-Length": String(buffer.length),
-        "Cache-Control": "public, max-age=86400, immutable",
-      },
-    });
+    const buffer = await synth(text, voice, rate, pitch);
+    return audioResponse(buffer);
   } catch (e) {
     console.error("TTS error", e);
     return new Response("TTS failed: " + (e?.message || "unknown"), { status: 500 });
   }
+}
+
+// GET : permet à <audio src="/api/tts?text=..."> de streamer directement.
+// C'est l'approche la plus iOS-friendly (pas de blob URL intermédiaire).
+export async function GET(req) {
+  const url = new URL(req.url);
+  return handle(readParams({
+    text: url.searchParams.get("text"),
+    voice: url.searchParams.get("voice"),
+    rate: url.searchParams.get("rate"),
+    pitch: url.searchParams.get("pitch"),
+  }));
+}
+
+// POST : conservé pour usage programmatique (fetch + cache préchargement)
+export async function POST(req) {
+  let body;
+  try { body = await req.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
+  return handle(readParams(body || {}));
 }

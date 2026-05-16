@@ -176,7 +176,7 @@ export default function Prompteur() {
   const sentenceIdxRef = useRef(0);
   const voiceEnabledRef = useRef(false);
   const audioRef = useRef(null);
-  const audioCacheRef = useRef(new Map()); // "idx|voice|rate|pitch" -> Promise<string>
+  const audioCacheRef = useRef(new Map()); // (deprecated, conservé pour compat)
   const wakeLockRef = useRef(null);
   const voiceURIRef = useRef("fr-FR-DeniseNeural");
   const voiceRateRef = useRef(1);
@@ -357,42 +357,27 @@ export default function Prompteur() {
   const sentenceDataRef = useRef(sentenceData);
   useEffect(() => { sentenceDataRef.current = sentenceData; }, [sentenceData]);
 
-  // Récupère (ou met en cache) le blob audio pour une phrase + params donnés
-  const fetchSentenceAudio = useCallback((idx) => {
-    const cache = audioCacheRef.current;
+  // Construit l'URL GET vers /api/tts pour une phrase donnée.
+  // L'élément <audio> stream directement cette URL (iOS-friendly, pas de blob).
+  const buildSentenceURL = useCallback((idx) => {
     const text = sentenceDataRef.current.all[idx];
-    if (!text) return Promise.reject(new Error("no sentence"));
-    const voice = voiceURIRef.current;
-    const rate = voiceRateRef.current;
-    const pitch = voicePitchRef.current;
-    const key = `${idx}|${voice}|${rate.toFixed(2)}|${pitch.toFixed(2)}`;
-    if (cache.has(key)) return cache.get(key);
-    const { ssmlRate } = computeRates(rate);
-    const promise = fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        voice,
-        rate: ssmlRate,
-        pitch: Math.round(pitch * 100),
-      }),
-    }).then(async (r) => {
-      if (!r.ok) throw new Error("TTS " + r.status);
-      return URL.createObjectURL(await r.blob());
-    }).catch((e) => {
-      cache.delete(key); // Permet retry après échec
-      throw e;
+    if (!text) return null;
+    const { ssmlRate } = computeRates(voiceRateRef.current);
+    const params = new URLSearchParams({
+      text,
+      voice: voiceURIRef.current,
+      rate: String(ssmlRate),
+      pitch: String(Math.round(voicePitchRef.current * 100)),
     });
-    cache.set(key, promise);
-    // Limite simple : 30 entrées max
-    if (cache.size > 30) {
-      const firstKey = cache.keys().next().value;
-      cache.get(firstKey)?.then((u) => URL.revokeObjectURL(u)).catch(() => {});
-      cache.delete(firstKey);
-    }
-    return promise;
+    return `/api/tts?${params.toString()}`;
   }, []);
+
+  // Précharge l'URL dans le HTTP cache du navigateur (réponse a Cache-Control immutable)
+  const preloadSentence = useCallback((idx) => {
+    const url = buildSentenceURL(idx);
+    if (!url) return;
+    fetch(url, { method: "GET", cache: "force-cache" }).catch(() => {});
+  }, [buildSentenceURL]);
 
   // Media Session API : métadonnées pour écran verrouillé
   const updateMediaSession = useCallback((idx) => {
@@ -430,7 +415,8 @@ export default function Prompteur() {
     updateMediaSession(idx);
     setVoiceLoading(true);
     try {
-      const url = await fetchSentenceAudio(idx);
+      const url = buildSentenceURL(idx);
+      if (!url) throw new Error("no sentence");
       if (!voiceEnabledRef.current || sentenceIdxRef.current !== idx) {
         setVoiceLoading(false);
         return;
@@ -439,13 +425,14 @@ export default function Prompteur() {
       audio.src = url;
       audio.playbackRate = computeRates(voiceRateRef.current).playbackRate;
       try { audio.preservesPitch = false; } catch {}
-      await audio.play();
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.then === "function") {
+        await playPromise;
+      }
       setVoiceLoading(false);
       consecutiveErrorsRef.current = 0;
-      // Précharge la phrase suivante
-      if (idx + 1 < total) {
-        fetchSentenceAudio(idx + 1).catch(() => {});
-      }
+      // Précharge la phrase suivante dans le HTTP cache du navigateur
+      if (idx + 1 < total) preloadSentence(idx + 1);
     } catch (e) {
       const msg = e?.message || String(e);
       console.warn("playSentence error idx=" + idx, msg);
@@ -468,7 +455,7 @@ export default function Prompteur() {
         }, 250);
       }
     }
-  }, [scrollToSentence, fetchSentenceAudio, updateMediaSession, ensureAudio]);
+  }, [scrollToSentence, buildSentenceURL, preloadSentence, updateMediaSession, ensureAudio]);
 
   // Attache les listeners audio dès qu'il existe — re-binde si l'audio est recréé
   const audioListenersAttachedRef = useRef(false);
@@ -604,8 +591,6 @@ export default function Prompteur() {
       voiceEnabledRef.current = false;
       const a = audioRef.current;
       if (a) { try { a.pause(); a.src = ""; } catch {} }
-      audioCacheRef.current.forEach((p) => p.then((url) => URL.revokeObjectURL(url)).catch(() => {}));
-      audioCacheRef.current.clear();
       releaseWakeLock();
     };
   }, [releaseWakeLock]);

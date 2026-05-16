@@ -394,11 +394,48 @@ export default function Prompteur() {
     } catch {}
   }, []);
 
+  // Fallback ultime : Web Speech API du navigateur (robotique mais TOUJOURS dispo).
+  // Activé automatiquement si l'API serverless échoue à répétition.
+  const useBrowserTTSRef = useRef(false);
+  const speakSentenceBrowserTTS = useCallback((idx) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return false;
+    const text = sentenceDataRef.current.all[idx];
+    if (!text) return false;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "fr-FR";
+      u.rate = Math.max(0.5, Math.min(2, voiceRateRef.current));
+      u.pitch = 1 + voicePitchRef.current;
+      u.onstart = () => {
+        setCurrentSentence(idx);
+        scrollToSentence(idx);
+        updateMediaSession(idx);
+        setVoiceLoading(false);
+      };
+      u.onend = () => {
+        if (!voiceEnabledRef.current) return;
+        sentenceIdxRef.current = idx + 1;
+        if (idx + 1 < sentenceDataRef.current.all.length) {
+          speakSentenceBrowserTTS(idx + 1);
+        } else {
+          voiceEnabledRef.current = false;
+          setVoiceEnabled(false);
+          setCurrentSentence(-1);
+        }
+      };
+      u.onerror = () => {
+        if (!voiceEnabledRef.current) return;
+        if (idx + 1 < sentenceDataRef.current.all.length) speakSentenceBrowserTTS(idx + 1);
+      };
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+      return true;
+    } catch { return false; }
+  }, [scrollToSentence, updateMediaSession]);
+
   // Lit la phrase à l'index donné — STABLE (ne dépend pas des paramètres dynamiques)
   const playSentence = useCallback(async (idx) => {
     if (!voiceEnabledRef.current) return;
-    const audio = audioRef.current || ensureAudio();
-    if (!audio) return;
     const total = sentenceDataRef.current.all.length;
     if (idx < 0) idx = 0;
     if (idx >= total) {
@@ -413,6 +450,16 @@ export default function Prompteur() {
     setCurrentSentence(idx);
     scrollToSentence(idx);
     updateMediaSession(idx);
+
+    // Mode fallback Web Speech API (API serverless en panne)
+    if (useBrowserTTSRef.current) {
+      setVoiceLoading(false);
+      speakSentenceBrowserTTS(idx);
+      return;
+    }
+
+    const audio = audioRef.current || ensureAudio();
+    if (!audio) return;
     setVoiceLoading(true);
     try {
       const url = buildSentenceURL(idx);
@@ -437,10 +484,21 @@ export default function Prompteur() {
       const msg = e?.message || String(e);
       console.warn("playSentence error idx=" + idx, msg);
       setVoiceLoading(false);
-      setVoiceError(msg);
       consecutiveErrorsRef.current += 1;
-      // Si trop d'erreurs consécutives, on stoppe pour éviter la boucle
+
+      // Après 2 erreurs API consécutives → bascule sur la voix navigateur (Web Speech API)
+      if (consecutiveErrorsRef.current >= 2 && !useBrowserTTSRef.current) {
+        if ("speechSynthesis" in window) {
+          useBrowserTTSRef.current = true;
+          setVoiceError("Serveur vocal indispo — voix de l'appareil");
+          consecutiveErrorsRef.current = 0;
+          if (voiceEnabledRef.current) speakSentenceBrowserTTS(idx);
+          return;
+        }
+      }
+
       if (consecutiveErrorsRef.current > 3) {
+        setVoiceError(msg);
         voiceEnabledRef.current = false;
         setVoiceEnabled(false);
         setVoicePaused(false);
@@ -455,7 +513,7 @@ export default function Prompteur() {
         }, 250);
       }
     }
-  }, [scrollToSentence, buildSentenceURL, preloadSentence, updateMediaSession, ensureAudio]);
+  }, [scrollToSentence, buildSentenceURL, preloadSentence, updateMediaSession, ensureAudio, speakSentenceBrowserTTS]);
 
   // Attache les listeners audio dès qu'il existe — re-binde si l'audio est recréé
   const audioListenersAttachedRef = useRef(false);
@@ -504,6 +562,9 @@ export default function Prompteur() {
     voiceEnabledRef.current = false;
     const a = audioRef.current;
     if (a) { try { a.pause(); } catch {} }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try { window.speechSynthesis.cancel(); } catch {}
+    }
     setVoiceEnabled(false);
     setVoicePaused(false);
     setVoiceLoading(false);
@@ -527,6 +588,13 @@ export default function Prompteur() {
   }, [pause, playSentence, requestWakeLock]);
 
   const toggleVoicePause = useCallback(() => {
+    // Mode fallback Web Speech API
+    if (useBrowserTTSRef.current && typeof window !== "undefined" && "speechSynthesis" in window) {
+      const ss = window.speechSynthesis;
+      if (ss.paused) { ss.resume(); setVoicePaused(false); }
+      else if (ss.speaking) { ss.pause(); setVoicePaused(true); }
+      return;
+    }
     const a = audioRef.current;
     if (!a) return;
     if (a.paused) {

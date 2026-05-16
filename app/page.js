@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ─── THEMES ───
 const THEMES = {
@@ -123,6 +123,15 @@ export default function Prompteur() {
   const [showFocusBand, setShowFocusBand] = useState(false);
   const [mounted, setMounted] = useState(false);
 
+  // Voice / TTS state
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voicePaused, setVoicePaused] = useState(false);
+  const [voiceRate, setVoiceRate] = useState(1);
+  const [voicePitch, setVoicePitch] = useState(1);
+  const [voiceURI, setVoiceURI] = useState("");
+  const [voices, setVoices] = useState([]);
+  const [currentSentence, setCurrentSentence] = useState(-1);
+
   const isMobile = useIsMobile();
   const t = THEMES[themeKey] || THEMES.sepia;
 
@@ -134,6 +143,8 @@ export default function Prompteur() {
   const controlsTimerRef = useRef(null);
   const touchStartRef = useRef({ x: 0, y: 0, t: 0 });
   const touchMoved = useRef(false);
+  const sentenceIdxRef = useRef(0);
+  const voiceEnabledRef = useRef(false);
 
   // Load saved prefs
   useEffect(() => {
@@ -142,6 +153,9 @@ export default function Prompteur() {
     setFontSize(loadFromStorage("fontSize", 32));
     setTextWidth(loadFromStorage("textWidth", 70));
     setRawText(loadFromStorage("text", ""));
+    setVoiceRate(loadFromStorage("voiceRate", 1));
+    setVoicePitch(loadFromStorage("voicePitch", 1));
+    setVoiceURI(loadFromStorage("voiceURI", ""));
     setMounted(true);
   }, []);
 
@@ -155,6 +169,9 @@ export default function Prompteur() {
     const debounce = setTimeout(() => saveToStorage("text", rawText), 1000);
     return () => clearTimeout(debounce);
   }, [rawText, mounted]);
+  useEffect(() => { if (mounted) saveToStorage("voiceRate", voiceRate); }, [voiceRate, mounted]);
+  useEffect(() => { if (mounted) saveToStorage("voicePitch", voicePitch); }, [voicePitch, mounted]);
+  useEffect(() => { if (mounted) saveToStorage("voiceURI", voiceURI); }, [voiceURI, mounted]);
 
   // Register SW
   useEffect(() => {
@@ -174,6 +191,38 @@ export default function Prompteur() {
   const paragraphs = rawText.split(/\n\s*\n/).filter(p => p.trim().length > 0);
   const wordCount = rawText.split(/\s+/).filter(w => w.length > 0).length;
   const estMinutes = wordCount > 0 ? Math.ceil(wordCount / (speed * 2.8)) : 0;
+
+  // Découpe le texte en phrases globales (avec index par paragraphe)
+  const sentenceData = useMemo(() => {
+    const all = [];
+    const byParagraph = paragraphs.map((para) => {
+      const parts = para.match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g) || [para];
+      return parts
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+        .map((text) => {
+          const idx = all.length;
+          all.push(text);
+          return { text, idx };
+        });
+    });
+    return { byParagraph, all };
+  }, [rawText]);
+
+  // Charge la liste des voix disponibles (Web Speech API)
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const load = () => {
+      const list = window.speechSynthesis.getVoices();
+      const fr = list.filter((v) => v.lang && v.lang.toLowerCase().startsWith("fr"));
+      setVoices(fr.length > 0 ? fr : list);
+    };
+    load();
+    window.speechSynthesis.onvoiceschanged = load;
+    return () => { if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null; };
+  }, []);
+
+  useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
 
   // Animation
   const animate = useCallback((ts) => {
@@ -212,10 +261,106 @@ export default function Prompteur() {
     if (playingRef.current) pause(); else play();
   }, [play, pause]);
 
+  // ─── VOICE / TTS ───
+  const scrollToSentence = useCallback((idx) => {
+    if (!scrollRef.current) return;
+    const el = scrollRef.current.querySelector(`[data-sentence="${idx}"]`);
+    if (!el) return;
+    const container = scrollRef.current;
+    const containerRect = container.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const targetTop = container.scrollTop + (elRect.top - containerRect.top) - containerRect.height * 0.38;
+    container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+  }, []);
+
+  const speakSentence = useCallback((idx) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (!voiceEnabledRef.current) return;
+    const list = sentenceData.all;
+    if (idx >= list.length) {
+      voiceEnabledRef.current = false;
+      setVoiceEnabled(false);
+      setVoicePaused(false);
+      setCurrentSentence(-1);
+      return;
+    }
+    const u = new SpeechSynthesisUtterance(list[idx]);
+    u.lang = "fr-FR";
+    u.rate = voiceRate;
+    u.pitch = voicePitch;
+    if (voiceURI) {
+      const v = window.speechSynthesis.getVoices().find((vv) => vv.voiceURI === voiceURI);
+      if (v) u.voice = v;
+    }
+    u.onstart = () => {
+      setCurrentSentence(idx);
+      scrollToSentence(idx);
+    };
+    u.onend = () => {
+      if (!voiceEnabledRef.current) return;
+      sentenceIdxRef.current = idx + 1;
+      speakSentence(idx + 1);
+    };
+    u.onerror = () => {
+      if (!voiceEnabledRef.current) return;
+      sentenceIdxRef.current = idx + 1;
+      speakSentence(idx + 1);
+    };
+    window.speechSynthesis.speak(u);
+  }, [sentenceData, voiceRate, voicePitch, voiceURI, scrollToSentence]);
+
+  const stopVoice = useCallback(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    voiceEnabledRef.current = false;
+    window.speechSynthesis.cancel();
+    setVoiceEnabled(false);
+    setVoicePaused(false);
+    setCurrentSentence(-1);
+  }, []);
+
+  const startVoice = useCallback((fromIdx = 0) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (sentenceData.all.length === 0) return;
+    pause(); // stop le scroll automatique
+    window.speechSynthesis.cancel();
+    voiceEnabledRef.current = true;
+    setVoiceEnabled(true);
+    setVoicePaused(false);
+    sentenceIdxRef.current = fromIdx;
+    speakSentence(fromIdx);
+  }, [pause, sentenceData, speakSentence]);
+
+  const toggleVoicePause = useCallback(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+      setVoicePaused(false);
+    } else if (window.speechSynthesis.speaking) {
+      window.speechSynthesis.pause();
+      setVoicePaused(true);
+    }
+  }, []);
+
+  const toggleVoice = useCallback(() => {
+    if (voiceEnabledRef.current) stopVoice();
+    else startVoice(Math.max(0, sentenceIdxRef.current));
+  }, [startVoice, stopVoice]);
+
+  // Stop la voix au démontage et quand on quitte le mode reader
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
   const resetScroll = useCallback(() => {
     pause();
+    stopVoice();
+    sentenceIdxRef.current = 0;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [pause]);
+  }, [pause, stopVoice]);
 
   const cleanText = (mode) => {
     let txt = rawText;
@@ -245,7 +390,13 @@ export default function Prompteur() {
     setShowSettings(false);
   };
 
-  const backToInput = () => { pause(); setView("input"); };
+  const backToInput = () => { pause(); stopVoice(); setView("input"); };
+
+  // Toggle unifié : si voix active → pause/resume vocal, sinon → play/pause visuel
+  const togglePlayOrVoice = useCallback(() => {
+    if (voiceEnabledRef.current) toggleVoicePause();
+    else togglePlay();
+  }, [togglePlay, toggleVoicePause]);
 
   const flashControls = useCallback(() => {
     setShowControls(true);
@@ -260,7 +411,8 @@ export default function Prompteur() {
     if (view !== "reader") return;
     const handler = (e) => {
       flashControls();
-      if (e.code === "Space") { e.preventDefault(); togglePlay(); }
+      if (e.code === "Space") { e.preventDefault(); togglePlayOrVoice(); }
+      if (e.code === "KeyV") { e.preventDefault(); toggleVoice(); }
       if (e.code === "ArrowUp") { e.preventDefault(); setSpeed(s => Math.min(MAX_SPEED, s + 10)); }
       if (e.code === "ArrowDown") { e.preventDefault(); setSpeed(s => Math.max(MIN_SPEED, s - 10)); }
       if (e.code === "ArrowLeft") { e.preventDefault(); pause(); if (scrollRef.current) scrollRef.current.scrollTop -= 200; }
@@ -274,7 +426,7 @@ export default function Prompteur() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [view, togglePlay, flashControls, pause, resetScroll]);
+  }, [view, togglePlay, togglePlayOrVoice, toggleVoice, flashControls, pause, resetScroll]);
 
   useEffect(() => { if (view === "reader") flashControls(); }, [view, flashControls]);
   useEffect(() => {
@@ -297,7 +449,7 @@ export default function Prompteur() {
     const dy = e.changedTouches[0].clientY - touchStartRef.current.y;
     const dt = Date.now() - touchStartRef.current.t;
     if (!touchMoved.current || (Math.abs(dx) < 15 && Math.abs(dy) < 15)) {
-      togglePlay(); return;
+      togglePlayOrVoice(); return;
     }
     if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 60 && dt < 400) {
       if (dx > 0) setSpeed(s => Math.max(MIN_SPEED, s - 15));
@@ -579,6 +731,12 @@ export default function Prompteur() {
               ))}
             </div>
             <div style={{ width: "1px", height: "16px", background: t.border }} />
+            <button onClick={toggleVoice} title="Lecture à haute voix (V)" style={{
+              ...btn,
+              background: voiceEnabled ? t.accentBg : t.controlBg,
+              color: voiceEnabled ? t.accent : t.textSoft,
+              fontSize: isMobile ? "18px" : "14px",
+            }}>🔊</button>
             <button onClick={() => setShowSettings(p => !p)} style={{
               ...btn,
               background: showSettings ? t.accentBg : t.controlBg,
@@ -636,6 +794,58 @@ export default function Prompteur() {
                 color: showFocusBand ? t.accent : t.textSoft,
               }}>{showFocusBand ? "ON" : "OFF"}</button>
             </div>
+
+            {/* ─── Lecture vocale ─── */}
+            <div style={{ height: "1px", background: t.border, margin: "4px 0" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ ...labelStyle(t), minWidth: "55px" }}>Voix</span>
+              <button onClick={toggleVoice} style={{
+                ...btn, width: "auto", padding: isMobile ? "10px 20px" : "6px 14px",
+                background: voiceEnabled ? t.accentGrad : t.controlBg,
+                color: voiceEnabled ? t.btnText : t.textSoft,
+                border: voiceEnabled ? "none" : `1px solid ${t.controlBorder}`,
+              }}>{voiceEnabled ? "🔊 Lire" : "🔇 Off"}</button>
+              {voiceEnabled && (
+                <button onClick={toggleVoicePause} style={{
+                  ...btn, width: "auto", padding: isMobile ? "10px 20px" : "6px 14px",
+                  background: t.controlBg, color: t.textSoft,
+                }}>{voicePaused ? "▶ Reprendre" : "⏸ Pause"}</button>
+              )}
+            </div>
+            {voices.length > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <span style={{ ...labelStyle(t), minWidth: "55px" }}>Timbre</span>
+                <select value={voiceURI} onChange={(e) => setVoiceURI(e.target.value)} style={{
+                  flex: 1, maxWidth: "300px",
+                  background: t.controlBg, border: `1px solid ${t.controlBorder}`,
+                  color: t.text, borderRadius: "8px",
+                  padding: isMobile ? "10px 12px" : "6px 10px",
+                  fontSize: isMobile ? "14px" : "12px",
+                  fontFamily: "'DM Sans', sans-serif",
+                }}>
+                  <option value="">Auto (système)</option>
+                  {voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ ...labelStyle(t), minWidth: "55px" }}>Débit</span>
+              <input type="range" min={0.5} max={2} step={0.05} value={voiceRate}
+                onChange={(e) => setVoiceRate(Number(e.target.value))}
+                style={{ flex: 1, maxWidth: "250px", accentColor: t.accent, background: t.rangeTrack }} />
+              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "36px" }}>{voiceRate.toFixed(2)}×</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ ...labelStyle(t), minWidth: "55px" }}>Hauteur</span>
+              <input type="range" min={0.5} max={1.5} step={0.05} value={voicePitch}
+                onChange={(e) => setVoicePitch(Number(e.target.value))}
+                style={{ flex: 1, maxWidth: "250px", accentColor: t.accent, background: t.rangeTrack }} />
+              <span style={{ fontSize: "12px", color: t.textSoft, minWidth: "36px" }}>{voicePitch.toFixed(2)}</span>
+            </div>
           </div>
         )}
 
@@ -653,7 +863,7 @@ export default function Prompteur() {
           onTouchStart={onTouchStart}
           onTouchMove={onTouchMove}
           onTouchEnd={onTouchEnd}
-          onClick={!isMobile ? togglePlay : undefined}
+          onClick={!isMobile ? togglePlayOrVoice : undefined}
           onScroll={() => { if (!playingRef.current) setProgress(getProgress()); }}
           style={{ flex: 1, overflowY: "auto", cursor: "pointer", WebkitOverflowScrolling: "touch" }}
         >
@@ -663,7 +873,7 @@ export default function Prompteur() {
             padding: isMobile ? "0 16px" : "0 24px",
             transform: mirrorMode ? "scaleX(-1)" : "none",
           }}>
-            {paragraphs.map((para, i) => (
+            {sentenceData.byParagraph.map((paraSentences, i) => (
               <p key={i} style={{
                 fontFamily: "'Literata', Georgia, serif",
                 fontSize: `${mfs}px`, fontWeight: 400,
@@ -672,7 +882,35 @@ export default function Prompteur() {
                 textAlign: isMobile ? "left" : "justify",
                 hyphens: "auto", letterSpacing: "-0.01em",
                 wordBreak: "break-word",
-              }}>{para.trim()}</p>
+              }}>
+                {paraSentences.map((s, k) => {
+                  const active = voiceEnabled && currentSentence === s.idx;
+                  return (
+                    <span
+                      key={s.idx}
+                      data-sentence={s.idx}
+                      onClick={(e) => {
+                        if (!voiceEnabled) return;
+                        e.stopPropagation();
+                        sentenceIdxRef.current = s.idx;
+                        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                          window.speechSynthesis.cancel();
+                        }
+                        speakSentence(s.idx);
+                      }}
+                      style={{
+                        background: active ? t.accentBg : "transparent",
+                        color: active ? t.accent : t.text,
+                        borderRadius: "4px",
+                        padding: active ? "2px 4px" : "0",
+                        margin: active ? "-2px -4px" : "0",
+                        transition: "background 0.25s, color 0.25s",
+                        cursor: voiceEnabled ? "pointer" : "inherit",
+                      }}
+                    >{s.text}{k < paraSentences.length - 1 ? " " : ""}</span>
+                  );
+                })}
+              </p>
             ))}
           </div>
           <div style={{ height: "75vh" }} />
@@ -701,13 +939,13 @@ export default function Prompteur() {
               </svg>
             </CircleBtn>
 
-            <button onClick={togglePlay} style={{
+            <button onClick={togglePlayOrVoice} style={{
               background: t.accentGrad, border: "none", color: t.btnText,
               width: isMobile ? "60px" : "48px", height: isMobile ? "60px" : "48px",
               borderRadius: "50%", cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
             }}>
-              {isPlaying ? (
+              {(voiceEnabled ? !voicePaused : isPlaying) ? (
                 <svg width={isMobile ? "22" : "20"} height={isMobile ? "22" : "20"} viewBox="0 0 24 24" fill="currentColor">
                   <rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" />
                 </svg>
@@ -747,7 +985,7 @@ export default function Prompteur() {
 
           {!isMobile && (
             <div style={{ display: "flex", justifyContent: "center", gap: "14px", paddingTop: "8px", paddingBottom: "4px" }}>
-              {[["Espace", "lecture"], ["←→", "naviguer"], ["↑↓", "vitesse"], ["T", "thème"], ["M", "miroir"], ["R", "reset"], ["Esc", "retour"]].map(([k, l]) => (
+              {[["Espace", "lecture"], ["←→", "naviguer"], ["↑↓", "vitesse"], ["V", "voix"], ["T", "thème"], ["M", "miroir"], ["R", "reset"], ["Esc", "retour"]].map(([k, l]) => (
                 <span key={k} style={{ fontSize: "10px", color: t.textMuted }}>
                   <kbd style={{ background: t.controlBg, padding: "1px 5px", borderRadius: "3px", fontSize: "10px", fontFamily: "'DM Sans'" }}>{k}</kbd> {l}
                 </span>

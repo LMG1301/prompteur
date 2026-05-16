@@ -159,6 +159,7 @@ export default function Prompteur() {
   const [voicePitch, setVoicePitch] = useState(0);
   const [voiceURI, setVoiceURI] = useState("fr-FR-DeniseNeural");
   const [voiceLoading, setVoiceLoading] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
   const [currentSentence, setCurrentSentence] = useState(-1);
 
   const isMobile = useIsMobile();
@@ -209,11 +210,33 @@ export default function Prompteur() {
   useEffect(() => { if (mounted) saveToStorage("voicePitch", voicePitch); }, [voicePitch, mounted]);
   useEffect(() => { if (mounted) saveToStorage("voiceURI", voiceURI); }, [voiceURI, mounted]);
 
-  // Register SW
+  // Register SW + auto-update détection
   useEffect(() => {
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
-    }
+    if (!("serviceWorker" in navigator)) return;
+    let reloading = false;
+    const onControllerChange = () => {
+      if (reloading) return;
+      reloading = true;
+      window.location.reload();
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+
+    navigator.serviceWorker.register("/sw.js").then((reg) => {
+      // Check pour update immédiate
+      reg.update().catch(() => {});
+      reg.addEventListener("updatefound", () => {
+        const newSW = reg.installing;
+        if (!newSW) return;
+        newSW.addEventListener("statechange", () => {
+          if (newSW.state === "installed" && navigator.serviceWorker.controller) {
+            // Nouveau SW prêt : on lui dit de prendre le relais
+            newSW.postMessage("SKIP_WAITING");
+          }
+        });
+      });
+    }).catch(() => {});
+
+    return () => navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
   }, []);
 
   useEffect(() => { speedRef.current = speed; }, [speed]);
@@ -402,8 +425,10 @@ export default function Prompteur() {
         fetchSentenceAudio(idx + 1).catch(() => {});
       }
     } catch (e) {
-      console.warn("playSentence error idx=" + idx, e?.message || e);
+      const msg = e?.message || String(e);
+      console.warn("playSentence error idx=" + idx, msg);
       setVoiceLoading(false);
+      setVoiceError(msg);
       consecutiveErrorsRef.current += 1;
       // Si trop d'erreurs consécutives, on stoppe pour éviter la boucle
       if (consecutiveErrorsRef.current > 3) {
@@ -485,6 +510,7 @@ export default function Prompteur() {
     voiceEnabledRef.current = true;
     setVoiceEnabled(true);
     setVoicePaused(false);
+    setVoiceError("");
     requestWakeLock();
     playSentence(fromIdx);
   }, [pause, playSentence, requestWakeLock]);
@@ -888,6 +914,24 @@ export default function Prompteur() {
           borderRight: `2px solid ${t.focusBandEdge}`,
           pointerEvents: "none", zIndex: 2,
         }} />}
+
+        {/* Toast erreur vocale */}
+        {voiceError && (
+          <div style={{
+            position: "absolute",
+            top: isMobile ? "calc(70px + env(safe-area-inset-top))" : "70px",
+            left: "50%", transform: "translateX(-50%)",
+            background: "rgba(220,38,38,0.95)", color: "white",
+            padding: "10px 16px", borderRadius: "10px",
+            fontSize: isMobile ? "13px" : "12px",
+            fontFamily: "'DM Sans', sans-serif", fontWeight: 600,
+            maxWidth: "90%", textAlign: "center", zIndex: 20,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+            cursor: "pointer",
+          }} onClick={() => setVoiceError("")}>
+            Erreur voix : {voiceError} · Tap pour fermer
+          </div>
+        )}
 
         {/* Top bar */}
         <div style={{
